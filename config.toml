@@ -1,0 +1,10 @@
+[global.config]
+  as = 65000
+  router-id = "1.0.0.0"
+  topolograph-watcher-endpoint = "localhost:50052"
+
+[[neighbors]]
+  [neighbors.config]
+    neighbor-address = ""
+    peer-as = 65000
+    topolograph-watcher-endpoint = "localhost:50052"

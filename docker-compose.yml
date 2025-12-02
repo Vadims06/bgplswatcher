@@ -1,0 +1,14 @@
+services:
+  bgplswatcher:
+    build:
+      context: ../..
+      dockerfile: cmd/bgplswatcher/Dockerfile
+    image: vadims06/bgplswatcher:latest
+    container_name: bgplswatcher
+    # Privileged mode needed for BGP
+    privileged: true
+    # Host networking needed for BGP
+    network_mode: host
+    volumes:
+      - ./config.toml:/app/config.toml:ro
+    restart: unless-stopped
