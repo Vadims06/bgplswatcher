@@ -4,15 +4,16 @@ import (
 	"context"
 	"fmt"
 	stdlog "log"
+	"log/slog"
 	"net"
 	"os"
 	"sync"
+	"time"
 
 	toml "github.com/BurntSushi/toml"
 	api "github.com/osrg/gobgp/v4/api"
-	"github.com/osrg/gobgp/v4/pkg/log"
+	"github.com/osrg/gobgp/v4/pkg/apiutil"
 	"github.com/osrg/gobgp/v4/pkg/server"
-	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
@@ -33,7 +34,9 @@ type GlobalConfigData struct {
 }
 
 type NeighborEntry struct {
-	Config NeighborConfig `toml:"config"`
+	Config       NeighborConfig     `toml:"config"`
+	Transport    TransportConfig    `toml:"transport"`
+	EbgpMultihop EbgpMultihopConfig `toml:"ebgp-multihop"`
 }
 
 type NeighborConfig struct {
@@ -42,6 +45,23 @@ type NeighborConfig struct {
 	TopolographWatcherEndpoint string `toml:"topolograph-watcher-endpoint"`
 	PassiveMode                bool   `toml:"passive-mode"`
 	LocalAddress               string `toml:"local-address"`
+}
+
+type TransportConfig struct {
+	Config TransportConfigData `toml:"config"`
+}
+
+type TransportConfigData struct {
+	LocalAddress string `toml:"local-address"`
+}
+
+type EbgpMultihopConfig struct {
+	Config EbgpMultihopConfigData `toml:"config"`
+}
+
+type EbgpMultihopConfigData struct {
+	Enabled     bool   `toml:"enabled"`
+	MultihopTtl uint32 `toml:"multihop-ttl"`
 }
 
 func main() {
@@ -73,8 +93,9 @@ func main() {
 	}
 
 	// Setup logging - use InfoLevel to avoid verbose byte dumps
-	logger := logrus.New()
-	logger.SetLevel(logrus.InfoLevel)
+	lvl := &slog.LevelVar{}
+	lvl.Set(slog.LevelInfo)
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: lvl}))
 
 	// Increase max message size to handle large BGP-LS messages (up to 1GB)
 	// Note: Messages can grow large when GoBGP includes accumulated RIB state or processes
@@ -87,10 +108,10 @@ func main() {
 
 	// Create GoBGP server - always enable gRPC listener on port 50051 for gobgp CLI access
 	var serverOpts []server.ServerOption
-	serverOpts = append(serverOpts, server.LoggerOption(&myLogger{logger: logger}))
+	serverOpts = append(serverOpts, server.LoggerOption(logger, lvl))
 	serverOpts = append(serverOpts, server.GrpcOption(grpcServerOpts))
 	serverOpts = append(serverOpts, server.GrpcListenAddress("0.0.0.0:50051"))
-	logger.Infof("GoBGP gRPC server listening on 0.0.0.0:50051 (gobgp CLI access enabled)")
+	logger.Info("GoBGP gRPC server listening on 0.0.0.0:50051 (gobgp CLI access enabled)")
 
 	s := server.NewBgpServer(serverOpts...)
 	go s.Serve()
@@ -103,7 +124,7 @@ func main() {
 			break
 		}
 	}
-	
+
 	listenPort := int32(-1)
 	if needsListener {
 		listenPort = 179 // Standard BGP port
@@ -148,7 +169,7 @@ func main() {
 			return nil, fmt.Errorf("ERROR: Topolograph watcher endpoint (%s) cannot be the same as GoBGP server port (50051). This would create an infinite loop! Use port 50052 instead", endpoint)
 		}
 
-		logger.Infof("Connecting to Topolograph watcher at %s...", endpoint)
+		logger.Info("Connecting to Topolograph watcher", slog.String("endpoint", endpoint))
 		conn, err := grpc.NewClient(endpoint,
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 			grpc.WithDefaultCallOptions(
@@ -163,7 +184,7 @@ func main() {
 		clientsMutex.Lock()
 		endpointToClient[endpoint] = client
 		clientsMutex.Unlock()
-		logger.Infof("Connected to Topolograph watcher at %s", endpoint)
+		logger.Info("Connected to Topolograph watcher", slog.String("endpoint", endpoint))
 
 		return client, nil
 	}
@@ -175,30 +196,22 @@ func main() {
 	}
 
 	// Watch for BGP events and forward to Topolograph watcher
-	// BatchSize=1 processes paths individually to avoid large message batches
-	if err := s.WatchEvent(context.Background(), &api.WatchEventRequest{
-		Table: &api.WatchEventRequest_Table{
-			Filters: []*api.WatchEventRequest_Table_Filter{
-				{Type: api.WatchEventRequest_Table_Filter_TYPE_BEST, Init: false}, // Only new changes, not initial dump
-			},
-		},
-		BatchSize: 1, // Process paths one at a time to avoid huge batches
-	}, func(r *api.WatchEventResponse) {
-		if t := r.GetTable(); t != nil {
-			if len(t.Paths) > 100 {
-				logger.Warnf("WARNING: Received unusually large batch of %d paths!", len(t.Paths))
+	if err := s.WatchEvent(context.Background(), server.WatchEventMessageCallbacks{
+		OnBestPath: func(paths []*apiutil.Path, timestamp time.Time) {
+			if len(paths) > 100 {
+				logger.Warn("Received unusually large batch of paths", slog.Int("count", len(paths)))
 			}
 
 			// Forward all BGP-LS paths to Topolograph watcher
 			forwarded := 0
-			for _, path := range t.Paths {
-				if path.Family != nil && path.Family.Afi == api.Family_AFI_LS && path.Family.Safi == api.Family_SAFI_LS {
+			for _, path := range paths {
+				if path.Family.Afi() == uint16(api.Family_AFI_LS) && path.Family.Safi() == uint8(api.Family_SAFI_LS) {
 					// Determine which endpoint to use based on neighbor IP
 					var targetClient api.GoBgpServiceClient = globalClient
 					endpoint := globalEndpoint // Default to global endpoint
-					neighborIP := path.NeighborIp
+					neighborIP := path.PeerAddress.String()
 
-					if neighborIP != "" {
+					if neighborIP != "" && neighborIP != "<nil>" {
 						// Try to find neighbor-specific endpoint
 						clientsMutex.RLock()
 						neighborEndpoint, found := neighborToEndpoint[neighborIP]
@@ -209,7 +222,7 @@ func main() {
 							// Get or create client for this endpoint
 							client, err := getClientForEndpoint(endpoint)
 							if err != nil {
-								logger.Errorf("Failed to get client for endpoint %s: %v", endpoint, err)
+								logger.Error("Failed to get client for endpoint", slog.String("endpoint", endpoint), slog.Any("error", err))
 								// Fall back to global client
 								targetClient = globalClient
 								endpoint = globalEndpoint // Reset to global for logging
@@ -219,43 +232,40 @@ func main() {
 						}
 					}
 
-					// Create a copy of the path for forwarding (to avoid modifying the original)
-					forwardPath := &api.Path{
-						Nlri:       path.Nlri,
-						Pattrs:     path.Pattrs,
-						Age:        path.Age,
-						IsWithdraw: path.IsWithdraw,
-						Family:     path.Family,
+					// Convert apiutil.Path to api.Path for forwarding
+					forwardPath, err := apiutil.NewPath(path.Family, path.Nlri, path.Withdrawal, path.Attrs, time.Unix(path.Age, 0))
+					if err != nil {
+						logger.Error("Failed to convert path", slog.Any("error", err))
+						continue
 					}
 
-					_, err := targetClient.AddPath(context.Background(), &api.AddPathRequest{
+					_, err = targetClient.AddPath(context.Background(), &api.AddPathRequest{
 						TableType: api.TableType_TABLE_TYPE_GLOBAL,
 						Path:      forwardPath,
 					})
 					if err != nil {
-						logger.Errorf("Failed to forward BGP-LS path to Topolograph watcher (endpoint: %s): %v", endpoint, err)
+						logger.Error("Failed to forward BGP-LS path to Topolograph watcher", slog.String("endpoint", endpoint), slog.Any("error", err))
 					} else {
-						logger.Infof("Successfully forwarded BGP-LS path to Topolograph watcher (endpoint: %s)", endpoint)
 						forwarded++
 					}
 				}
 			}
 			if forwarded > 0 {
-				logger.Infof("Forwarded %d BGP-LS paths to Topolograph watcher", forwarded)
+				logger.Info("Forwarded BGP-LS paths to Topolograph watcher", slog.Int("count", forwarded))
 			}
-		}
-	}); err != nil {
+		},
+	}, server.WatchBestPath(false)); err != nil {
 		stdlog.Fatal(err)
 	}
 
-	logger.Infof("WatchEvent configured to forward BGP-LS routes (global endpoint: %s)", globalEndpoint)
+	logger.Info("WatchEvent configured to forward BGP-LS routes", slog.String("global_endpoint", globalEndpoint))
 
 	// Add BGP neighbors from config
 	if len(config.Neighbors) > 0 {
 		for _, neighborEntry := range config.Neighbors {
 			neighborConfig := neighborEntry.Config
 			if neighborConfig.NeighborAddress == "" {
-				logger.Infof("Skipping neighbor with empty neighbor-address")
+				logger.Info("Skipping neighbor with empty neighbor-address")
 				continue
 			}
 
@@ -271,7 +281,7 @@ func main() {
 				clientsMutex.Lock()
 				neighborToEndpoint[neighborIP.String()] = neighborEndpoint
 				clientsMutex.Unlock()
-				logger.Infof("Mapped neighbor %s to endpoint %s", neighborConfig.NeighborAddress, neighborEndpoint)
+				logger.Info("Mapped neighbor to endpoint", slog.String("neighbor", neighborConfig.NeighborAddress), slog.String("endpoint", neighborEndpoint))
 
 				// Pre-create connection for this endpoint if different from global
 				if neighborEndpoint != globalEndpoint {
@@ -282,7 +292,7 @@ func main() {
 				}
 			}
 
-			logger.Infof("Adding BGP peer: %s (ASN: %d)", neighborConfig.NeighborAddress, neighborConfig.PeerAS)
+			logger.Info("Adding BGP peer", slog.String("neighbor", neighborConfig.NeighborAddress), slog.Int("asn", int(neighborConfig.PeerAS)))
 			peer := &api.Peer{
 				Conf: &api.PeerConf{
 					NeighborAddress: neighborConfig.NeighborAddress,
@@ -315,6 +325,20 @@ func main() {
 			}
 			if neighborConfig.LocalAddress != "" {
 				peer.Transport.LocalAddress = neighborConfig.LocalAddress
+			} else if neighborEntry.Transport.Config.LocalAddress != "" {
+				peer.Transport.LocalAddress = neighborEntry.Transport.Config.LocalAddress
+			}
+
+			// Set eBGP multihop configuration if enabled
+			if neighborEntry.EbgpMultihop.Config.Enabled {
+				peer.EbgpMultihop = &api.EbgpMultihop{
+					Enabled:     true,
+					MultihopTtl: neighborEntry.EbgpMultihop.Config.MultihopTtl,
+				}
+				logger.Info("eBGP multihop configured",
+					slog.String("neighbor", neighborConfig.NeighborAddress),
+					slog.Bool("enabled", true),
+					slog.Int("multihop-ttl", int(neighborEntry.EbgpMultihop.Config.MultihopTtl)))
 			}
 
 			if err := s.AddPeer(context.Background(), &api.AddPeerRequest{
@@ -322,48 +346,12 @@ func main() {
 			}); err != nil {
 				stdlog.Fatalf("Failed to add peer %s: %v", neighborConfig.NeighborAddress, err)
 			}
-			logger.Infof("BGP peer %s added successfully (will forward to endpoint: %s)", neighborConfig.NeighborAddress, neighborEndpoint)
+			logger.Info("BGP peer added successfully", slog.String("peer", neighborConfig.NeighborAddress), slog.String("endpoint", neighborEndpoint))
 		}
 	} else {
-		logger.Infof("No neighbors configured - running in local mode. Routes can be added manually via gobgp CLI")
+		logger.Info("No neighbors configured - running in local mode. Routes can be added manually via gobgp CLI")
 	}
 
 	// Wait forever
 	select {}
-}
-
-type myLogger struct {
-	logger *logrus.Logger
-}
-
-func (l *myLogger) Panic(msg string, fields log.Fields) {
-	l.logger.WithFields(logrus.Fields(fields)).Panic(msg)
-}
-
-func (l *myLogger) Fatal(msg string, fields log.Fields) {
-	l.logger.WithFields(logrus.Fields(fields)).Fatal(msg)
-}
-
-func (l *myLogger) Error(msg string, fields log.Fields) {
-	l.logger.WithFields(logrus.Fields(fields)).Error(msg)
-}
-
-func (l *myLogger) Warn(msg string, fields log.Fields) {
-	l.logger.WithFields(logrus.Fields(fields)).Warn(msg)
-}
-
-func (l *myLogger) Info(msg string, fields log.Fields) {
-	l.logger.WithFields(logrus.Fields(fields)).Info(msg)
-}
-
-func (l *myLogger) Debug(msg string, fields log.Fields) {
-	l.logger.WithFields(logrus.Fields(fields)).Debug(msg)
-}
-
-func (l *myLogger) SetLevel(level log.LogLevel) {
-	l.logger.SetLevel(logrus.Level(int(level)))
-}
-
-func (l *myLogger) GetLevel() log.LogLevel {
-	return log.LogLevel(l.logger.GetLevel())
 }

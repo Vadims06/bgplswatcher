@@ -1,5 +1,5 @@
 # Build stage
-FROM golang:1.24-alpine AS builder
+FROM golang:1.24.5-alpine AS builder
 
 WORKDIR /app
 # Copy gobgp root go.mod for replace directive
@@ -20,15 +20,15 @@ WORKDIR /app/cmd/bgplswatcher
 # Install build dependencies
 RUN apk add --no-cache git
 
-# Download dependencies
-RUN go mod download
+# Download dependencies and update go.sum
+RUN go mod download && go mod tidy
 
-# Build bgplswatcher
-RUN CGO_ENABLED=0 GOOS=linux go build -o bgplswatcher
+# Build bgplswatcher (force rebuild to ensure latest code)
+RUN CGO_ENABLED=0 GOOS=linux go build -a -o bgplswatcher
 
-# Build gobgp CLI
+# Build gobgp CLI (force rebuild to ensure latest code)
 WORKDIR /app/cmd/gobgp
-RUN CGO_ENABLED=0 GOOS=linux go build -o gobgp
+RUN CGO_ENABLED=0 GOOS=linux go build -a -o gobgp
 
 # Final stage
 FROM alpine:3.18
