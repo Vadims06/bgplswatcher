@@ -13,6 +13,7 @@ import (
 	toml "github.com/BurntSushi/toml"
 	api "github.com/osrg/gobgp/v4/api"
 	"github.com/osrg/gobgp/v4/pkg/apiutil"
+	"github.com/osrg/gobgp/v4/pkg/packet/bgp"
 	"github.com/osrg/gobgp/v4/pkg/server"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -195,6 +196,10 @@ func main() {
 		stdlog.Fatal(err)
 	}
 
+	// Note: Peer events are automatically available via WatchEvent stream.
+	// Python watcher should subscribe to WatchEvent from bgplswatcher (port 50051) to receive peer events.
+	// No special forwarding needed - events flow through the existing WatchEvent server.
+
 	// Watch for BGP events and forward to Topolograph watcher
 	if err := s.WatchEvent(context.Background(), server.WatchEventMessageCallbacks{
 		OnBestPath: func(paths []*apiutil.Path, timestamp time.Time) {
@@ -254,7 +259,22 @@ func main() {
 				logger.Info("Forwarded BGP-LS paths to Topolograph watcher", slog.Int("count", forwarded))
 			}
 		},
-	}, server.WatchBestPath(false)); err != nil {
+		OnPeerUpdate: func(peer *apiutil.WatchEventMessage_PeerEvent, timestamp time.Time) {
+			// Peer events are automatically streamed via WatchEvent to any subscribed clients.
+			// Python watcher should subscribe to WatchEvent from bgplswatcher (port 50051) to receive peer events.
+			// Log peer establishment for debugging.
+			if peer != nil && peer.Type == apiutil.PEER_EVENT_STATE {
+				if peer.Peer.State.SessionState == bgp.BGP_FSM_ESTABLISHED {
+					peerIP := peer.Peer.State.NeighborAddress.String()
+					tcpPort := peer.Peer.Transport.RemotePort
+					logger.Info("BGP peer session established",
+						slog.String("peer_ip", peerIP),
+						slog.Int("tcp_port", int(tcpPort)),
+						slog.String("note", "Peer events available via WatchEvent stream"))
+				}
+			}
+		},
+	}, server.WatchBestPath(false), server.WatchPeer()); err != nil {
 		stdlog.Fatal(err)
 	}
 
