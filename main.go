@@ -32,6 +32,8 @@ type GlobalConfigData struct {
 	AS                         uint32 `toml:"as"`
 	RouterID                   string `toml:"router-id"`
 	TopolographWatcherEndpoint string `toml:"topolograph-watcher-endpoint"`
+	// WaitSecBeforeSendTopology delays the first gRPC dial to the watcher so ospfwatcher can bind its port.
+	WaitSecBeforeSendTopology int `toml:"wait_sec_before_send_topology"`
 }
 
 type NeighborEntry struct {
@@ -154,6 +156,7 @@ func main() {
 	neighborToEndpoint := make(map[string]string)               // neighbor IP -> endpoint
 	endpointToClient := make(map[string]api.GoBgpServiceClient) // endpoint -> client
 	var clientsMutex sync.RWMutex
+	var waitBeforeWatcherOnce sync.Once
 
 	// Helper function to get or create client for an endpoint
 	getClientForEndpoint := func(endpoint string) (api.GoBgpServiceClient, error) {
@@ -171,6 +174,13 @@ func main() {
 		}
 
 		logger.Info("Connecting to Topolograph watcher", slog.String("endpoint", endpoint))
+		waitBeforeWatcherOnce.Do(func() {
+			if ws := config.Global.Config.WaitSecBeforeSendTopology; ws > 0 {
+				logger.Info("Waiting before first gRPC dial to Topolograph watcher",
+					slog.Int("wait_sec_before_send_topology", ws))
+				time.Sleep(time.Duration(ws) * time.Second)
+			}
+		})
 		conn, err := grpc.NewClient(endpoint,
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 			grpc.WithDefaultCallOptions(
