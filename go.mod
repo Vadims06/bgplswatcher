@@ -6,7 +6,7 @@ toolchain go1.24.4
 
 require (
 	github.com/BurntSushi/toml v1.3.2
-	github.com/osrg/gobgp/v4 v4.0.0
+	github.com/osrg/gobgp/v4 v4.6.0
 	github.com/sirupsen/logrus v1.9.3
 	google.golang.org/grpc v1.64.1
 )
