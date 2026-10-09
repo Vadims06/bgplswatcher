@@ -328,6 +328,7 @@ func main() {
 					NeighborAddress: neighborConfig.NeighborAddress,
 					PeerAsn:         neighborConfig.PeerAS,
 				},
+				Timers: newPeerTimers(),
 				ApplyPolicy: &api.ApplyPolicy{
 					ImportPolicy: &api.PolicyAssignment{
 						DefaultAction: api.RouteAction_ROUTE_ACTION_ACCEPT,
@@ -384,4 +385,10 @@ func main() {
 
 	// Wait forever
 	select {}
+}
+
+// newPeerTimers shortens ConnectRetry from GoBGP's 120 s default, so the watcher
+// redials quickly when the router is not up yet. Other timers keep GoBGP defaults.
+func newPeerTimers() *api.Timers {
+	return &api.Timers{Config: &api.TimersConfig{ConnectRetry: 10}}
 }
