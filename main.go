@@ -144,6 +144,12 @@ func main() {
 		stdlog.Fatal(err)
 	}
 
+	// Never pass one router's link-state on to another router (several
+	// [[neighbors]] share this one BGP speaker).
+	if err := blockReadvertisement(context.Background(), s); err != nil {
+		stdlog.Fatal(err)
+	}
+
 	// Get topolograph watcher endpoint from global config
 	globalEndpoint := config.Global.Config.TopolographWatcherEndpoint
 
@@ -210,9 +216,14 @@ func main() {
 	// Python watcher should subscribe to WatchEvent from bgplswatcher (port 50051) to receive peer events.
 	// No special forwarding needed - events flow through the existing WatchEvent server.
 
-	// Watch for BGP events and forward to Topolograph watcher
-	if err := s.WatchEvent(context.Background(), server.WatchEventMessageCallbacks{
-		OnBestPath: func(paths []*apiutil.Path, timestamp time.Time) {
+	// Watch for BGP events and forward to Topolograph watcher. Paths come from
+	// adj-in (what each router sent, before policy): blockReadvertisement keeps
+	// them out of the global RIB, so there are no best-path events.
+	known := newKnownPaths()
+	var callbacks server.WatchEventMessageCallbacks
+	callbacks = server.WatchEventMessageCallbacks{
+		OnPathUpdate: func(paths []*apiutil.Path, timestamp time.Time) {
+			paths = known.update(paths)
 			if len(paths) > 100 {
 				logger.Warn("Received unusually large batch of paths", slog.Int("count", len(paths)))
 			}
@@ -281,10 +292,15 @@ func main() {
 						slog.String("peer_ip", peerIP),
 						slog.Int("tcp_port", int(tcpPort)),
 						slog.String("note", "Peer events available via WatchEvent stream"))
+				} else {
+					// The session is down: withdraw that router's paths at the
+					// watcher. (The global RIB used to do this; it holds nothing now.)
+					callbacks.OnPathUpdate(known.withdrawAll(peer.Peer.State.NeighborAddress.String()), timestamp)
 				}
 			}
 		},
-	}, server.WatchBestPath(false), server.WatchPeer()); err != nil {
+	}
+	if err := s.WatchEvent(context.Background(), callbacks, server.WatchUpdate(false, "", ""), server.WatchPeer()); err != nil {
 		stdlog.Fatal(err)
 	}
 
@@ -391,4 +407,66 @@ func main() {
 // redials quickly when the router is not up yet. Other timers keep GoBGP defaults.
 func newPeerTimers() *api.Timers {
 	return &api.Timers{Config: &api.TimersConfig{ConnectRetry: 10}}
+}
+
+// blockReadvertisement keeps received paths out of the global RIB (global
+// import policy REJECT), so GoBGP never advertises or withdraws one router's
+// paths towards another. The per-peer export REJECT set in main() does not do
+// this: GoBGP reads a peer's own policy for route-server clients only, every
+// other peer exports from the global RIB through the global policy (default
+// ACCEPT), and export policy never filters withdrawals.
+func blockReadvertisement(ctx context.Context, s *server.BgpServer) error {
+	return s.SetPolicyAssignment(ctx, &api.SetPolicyAssignmentRequest{
+		Assignment: &api.PolicyAssignment{
+			Name:          "global",
+			Direction:     api.PolicyDirection_POLICY_DIRECTION_IMPORT,
+			DefaultAction: api.RouteAction_ROUTE_ACTION_REJECT,
+		},
+	})
+}
+
+// knownPaths remembers the BGP-LS paths each router has sent and not yet
+// withdrawn, so they can be withdrawn at the watcher when its session drops.
+type knownPaths struct {
+	mu     sync.Mutex
+	byPeer map[string]map[string]*apiutil.Path // neighbor IP -> NLRI -> path
+}
+
+func newKnownPaths() *knownPaths {
+	return &knownPaths{byPeer: map[string]map[string]*apiutil.Path{}}
+}
+
+// update records the BGP-LS paths in paths and returns paths unchanged.
+func (k *knownPaths) update(paths []*apiutil.Path) []*apiutil.Path {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	for _, p := range paths {
+		if p.Family != bgp.RF_LS || p.Nlri == nil {
+			continue
+		}
+		peer := p.PeerAddress.String()
+		if p.Withdrawal {
+			delete(k.byPeer[peer], p.Nlri.String())
+			continue
+		}
+		if k.byPeer[peer] == nil {
+			k.byPeer[peer] = map[string]*apiutil.Path{}
+		}
+		k.byPeer[peer][p.Nlri.String()] = p
+	}
+	return paths
+}
+
+// withdrawAll forgets a router's paths and returns a withdrawal for each.
+func (k *knownPaths) withdrawAll(peer string) []*apiutil.Path {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	var withdrawals []*apiutil.Path
+	for _, p := range k.byPeer[peer] {
+		w := *p
+		w.Withdrawal = true
+		withdrawals = append(withdrawals, &w)
+	}
+	delete(k.byPeer, peer)
+	return withdrawals
 }
