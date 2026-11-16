@@ -20,6 +20,12 @@ Configure via `config.toml`:
     passive-mode = false
 ```
 
+Several `[[neighbors]]` can share one bgplswatcher, each with its own
+`topolograph-watcher-endpoint`. bgplswatcher never advertises anything to a
+router, not even one router's withdrawals to another: received paths stay out
+of the global RIB and are forwarded from each neighbor's adj-in. So
+`gobgp global rib -a ls` is empty; use `gobgp neighbor <ip> adj-in -a ls`.
+
 ## Usage
 
 ```bash
